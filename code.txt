@@ -1,56 +1,6 @@
-#!/usr/bin/env python3
-"""
-XPS plotting with fixed x-axes from supervisor sketches.
 
-Main plotting rule
-------------------
-For each treatment panel:
+XPS plotting with fixed x-axes
 
-Support / oxide series
-    - VBM
-    - O 1s
-    - Ti 2p
-
-use the matching bare TiO2 sample as anchor when that time-matched bare
-reference exists in the dataset.
-
-If the bare point has:
-    VBM_bare, O1s_bare, Ti2p_bare
-
-then:
-    VBM_plot(i)  = VBM(i)
-    O1s_plot(i)  = VBM_bare + [O1s(i)  - O1s_bare]
-    Ti2p_plot(i) = VBM_bare + [Ti2p(i) - Ti2p_bare]
-
-Metal series
-    - Cu 2p
-    - Co 2p
-    - Fe 2p
-    - Ir
-
-do NOT get an artificial bare-TiO2 point.
-They start from the first doped condition present within each time block.
-
-If the first doped point has:
-    VBM_metal0, BE_metal0
-
-then:
-    metal_plot(i) = VBM_metal0 + [BE_metal(i) - BE_metal0]
-
-So in treatment panels:
-- bare TiO2 appears as the first x-category for each time block
-- VBM / O 1s / Ti 2p start from bare TiO2
-- metal series start from the first doped condition
-- metal value at the bare TiO2 x-position is NaN
-
-Special case: plain TiO2
-------------------------
-Plain TiO2 is plotted separately as a supervisor-style VBM vs time comparison:
-- plain
-- plain | Air
-- plain | Ar/H2
-
-This is NOT plotted using the mixed-anchor O1s/Ti2p/VBM logic.
 """
 
 from __future__ import annotations
