@@ -1,0 +1,1724 @@
+#!/usr/bin/env python3
+"""
+XPS plotting with fixed x-axes from supervisor sketches.
+
+Main plotting rule
+------------------
+For each treatment panel:
+
+Support / oxide series
+    - VBM
+    - O 1s
+    - Ti 2p
+
+use the matching bare TiO2 sample as anchor when that time-matched bare
+reference exists in the dataset.
+
+If the bare point has:
+    VBM_bare, O1s_bare, Ti2p_bare
+
+then:
+    VBM_plot(i)  = VBM(i)
+    O1s_plot(i)  = VBM_bare + [O1s(i)  - O1s_bare]
+    Ti2p_plot(i) = VBM_bare + [Ti2p(i) - Ti2p_bare]
+
+Metal series
+    - Cu 2p
+    - Co 2p
+    - Fe 2p
+    - Ir
+
+do NOT get an artificial bare-TiO2 point.
+They start from the first doped condition present within each time block.
+
+If the first doped point has:
+    VBM_metal0, BE_metal0
+
+then:
+    metal_plot(i) = VBM_metal0 + [BE_metal(i) - BE_metal0]
+
+So in treatment panels:
+- bare TiO2 appears as the first x-category for each time block
+- VBM / O 1s / Ti 2p start from bare TiO2
+- metal series start from the first doped condition
+- metal value at the bare TiO2 x-position is NaN
+
+Special case: plain TiO2
+------------------------
+Plain TiO2 is plotted separately as a supervisor-style VBM vs time comparison:
+- plain
+- plain | Air
+- plain | Ar/H2
+
+This is NOT plotted using the mixed-anchor O1s/Ti2p/VBM logic.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional
+import re
+import math
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from vamas import Vamas
+from scipy.optimize import curve_fit
+from scipy.signal import savgol_filter
+from scipy.special import erfc
+
+
+# =============================================================================
+# USER SETTINGS
+# =============================================================================
+
+DATA_ROOTS = [
+    Path("/home/g060095/Compton/Material_chemistry/new_data"),
+    Path("/home/g060095/Compton/Material_chemistry/Fe/Fe_TiO2/Fe_TiO2"),
+    Path("/home/g060095/Compton/Material_chemistry/plain_TiO2/Plain TiO2"),
+    Path("/home/g060095/Compton/Material_chemistry/Co/Co_TiO2"),
+    Path("/home/g060095/Compton/Material_chemistry/Ir/Ir_TiO2"),
+]
+
+OUTPUT_DIR = Path("/home/g060095/Compton/Material_chemistry/final_new_results5")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+REFERENCE_ENERGY = 284.8  # C 1s calibration reference
+
+REFERENCE_PEAKS = {
+    "O1s": 530.4,
+    "Ti2p": 453.9,
+    "Cu2p": 933.0,
+    "Fe2p": 709.0,
+    "Co2p": 778.1,
+    "Ir": 61.8,
+}
+
+VB_REGION_MAIN = (1.0, 12.0)
+VB_REGION_CHECK = (1.5, 11.0)
+VB_SMOOTH_WINDOW = 7
+VB_SMOOTH_POLY = 2
+
+VBM_STABILITY_THRESH = 0.35
+MAX_REASONABLE_VBM = 4.5
+MAX_REASONABLE_SHIFT = 3.5
+
+PEAK_WINDOWS = {
+    "O1s":  (528.0, 533.5),
+    "Ti2p": (457.0, 460.5),
+    "Cu2p": (931.0, 935.5),
+    "Fe2p": (707.0, 712.5),
+    "Co2p": (776.0, 782.5),
+    "Ir":   (60.0, 63.5),
+}
+
+EXPECTED_MAIN_PEAK = {
+    "O1s":  530.4,
+    "Ti2p": 458.5,
+    "Cu2p": 933.0,
+    "Fe2p": 709.0,
+    "Co2p": 778.1,
+    "Ir":   61.8,
+}
+
+MAX_PEAK_DEVIATION = {
+    "O1s":  1.5,
+    "Ti2p": 1.5,
+    "Cu2p": 1.5,
+    "Fe2p": 1.5,
+    "Co2p": 1.5,
+    "Ir":   1.0,
+}
+
+XORDER_PLAIN = ["30", "60", "120"]
+XORDER_CU_LSV = ["NLS 3cy", "WLS 3cy", "NLS 6cy", "WLS 6cy"]
+XORDER_CU_PLSV = ["NLS 50cy", "WLS 50cy"]
+XORDER_CO = ["NC-NLS", "NC-WLS", "NP-NLS", "NP-WLS", "WP-NLS", "WP-WLS"]
+XORDER_IR = [
+    "NP-0.05-NLS",
+    "NP-0.05-WLS",
+    "WP-0.05-NLS",
+    "WP-0.05-WLS",
+    "NP-0.1-NLS",
+    "NP-0.1-WLS",
+    "WP-0.1-NLS",
+    "WP-0.1-WLS",
+]
+
+FE_METHOD_ORDER = {"NLS": 0, "WLS": 1, "WMS": 2}
+FE_FAMILY_TITLE = {
+    "FC": "FC",
+    "FCH": "Fechloridehexahydrate",
+    "FNH": "Fenitratenonahydrate",
+}
+
+
+# =============================================================================
+# DATA STRUCTURES
+# =============================================================================
+
+@dataclass
+class CalibrationResult:
+    c1s_block: str
+    c1s_measured_raw_eV: float
+    shift_eV: float
+
+
+# =============================================================================
+# BASIC HELPERS
+# =============================================================================
+
+def energy_axis(block) -> np.ndarray:
+    n = block.num_y_values
+    return block.x_start + block.x_step * np.arange(n, dtype=float)
+
+
+def counts(block, var_index: int = 0) -> np.ndarray:
+    return np.array(block.corresponding_variables[var_index].y_values, dtype=float)
+
+
+def choose_reference_block(blocks: List):
+    candidates = []
+
+    for b in blocks:
+        if (b.technique or "").strip().upper() != "XPS":
+            continue
+        species = (b.species_label or "").strip().upper()
+        transition = (b.transition_or_charge_state_label or "").strip().lower()
+        if species == "C" and "1s" in transition:
+            candidates.append(b)
+
+    if not candidates:
+        for b in blocks:
+            label = (b.block_identifier or "").lower()
+            if "c" in label and "1s" in label:
+                candidates.append(b)
+
+    if not candidates:
+        raise RuntimeError("Could not find C 1s reference block.")
+
+    return candidates[0]
+
+
+def find_peak_position_centroid(E: np.ndarray, I: np.ndarray, window_points: int = 5) -> float:
+    idx_max = int(np.argmax(I))
+    lo = max(0, idx_max - window_points)
+    hi = min(len(I), idx_max + window_points + 1)
+    Ew = E[lo:hi]
+    Iw = I[lo:hi]
+    if np.all(Iw <= 0):
+        return float(E[idx_max])
+    return float(np.sum(Ew * Iw) / np.sum(Iw))
+
+
+def choose_vb_block_from_arrays(arrays: Dict[str, Dict[str, np.ndarray]]) -> Optional[str]:
+    """
+    Prefer blocks explicitly named as VB/valence.
+    If not found, fall back to any narrow low-BE block that spans the VBM region.
+    This is important for plain TiO2 files where the VB block name may not contain 'vb'.
+    """
+    named = []
+    fallback = []
+
+    for block_id, arr in arrays.items():
+        E = np.asarray(arr["E_cal"], dtype=float)
+        if E.size < 8:
+            continue
+
+        emin = float(np.nanmin(E))
+        emax = float(np.nanmax(E))
+        width = emax - emin
+        name = block_id.lower()
+
+        spans_vbm = (emin <= VB_REGION_MAIN[0]) and (emax >= VB_REGION_MAIN[1])
+
+        if not spans_vbm:
+            continue
+
+        if ("vb" in name) or ("valence" in name) or re.search(r'(^|[_\s-])val([_\s-]|$)', name):
+            named.append((block_id, width, emin, emax))
+        else:
+            fallback.append((block_id, width, emin, emax))
+
+    if named:
+        named.sort(key=lambda x: (x[1], x[2], x[3]))
+        return named[0][0]
+
+    if fallback:
+        fallback.sort(key=lambda x: (x[1], x[2], x[3]))
+        return fallback[0][0]
+
+    return None
+
+
+# =============================================================================
+# BACKGROUNDS
+# =============================================================================
+
+def classify_block_for_background(block) -> str:
+    name = (block.block_identifier or "").strip().lower()
+    species = (block.species_label or "").strip().lower()
+
+    if "vb" in name or "valence" in name:
+        return "edge_down"
+    if "survey" in name:
+        return "none"
+    if species in {"c", "ti", "o", "cu", "fe", "co", "ir", "mg"}:
+        return "shirley"
+    return "none"
+
+
+def shirley_background(I: np.ndarray, max_iter: int = 50, tol: float = 1e-6) -> np.ndarray:
+    I = np.asarray(I, dtype=float)
+    n = I.size
+    if n < 3:
+        return np.zeros_like(I)
+
+    B = np.linspace(I[0], I[-1], n)
+
+    for _ in range(max_iter):
+        diff = I - B
+        cum = np.cumsum(diff[::-1])[::-1]
+        denom = cum[0]
+        if denom == 0:
+            break
+
+        B_new = I[-1] + (I[0] - I[-1]) * (cum / denom)
+        if np.max(np.abs(B_new - B)) < tol:
+            B = B_new
+            break
+        B = B_new
+
+    return B
+
+
+def edge_down_background(E: np.ndarray, I: np.ndarray) -> np.ndarray:
+    E = np.asarray(E, dtype=float)
+    I = np.asarray(I, dtype=float)
+    if I.size < 2:
+        return np.zeros_like(I)
+    if E[-1] == E[0]:
+        return np.full_like(I, I[0])
+
+    m = (I[-1] - I[0]) / (E[-1] - E[0])
+    return I[0] + m * (E - E[0])
+
+
+# =============================================================================
+# SMOOTHING
+# =============================================================================
+
+def smooth_intensity(I: np.ndarray, window_points: int = VB_SMOOTH_WINDOW, polyorder: int = VB_SMOOTH_POLY) -> np.ndarray:
+    I = np.asarray(I, dtype=float)
+    if I.size < 3:
+        return I.copy()
+
+    window_points = max(window_points, polyorder + 2)
+    if window_points % 2 == 0:
+        window_points += 1
+    if I.size < window_points:
+        return I.copy()
+
+    return savgol_filter(I, window_points, polyorder)
+
+
+# =============================================================================
+# ERFC VBM FIT
+# =============================================================================
+
+def erfc_edge(E: np.ndarray, B: float, H: float, Ev: float, w: float) -> np.ndarray:
+    return B + 0.5 * H * erfc((Ev - E) / w)
+
+
+def fit_vbm_erfc(
+    energy: np.ndarray,
+    intensity: np.ndarray,
+    region: Tuple[float, float],
+) -> Optional[Tuple[float, float, float, float, float]]:
+    energy = np.asarray(energy, dtype=float)
+    intensity = np.asarray(intensity, dtype=float)
+
+    Emin, Emax = region
+    mask = (energy >= Emin) & (energy <= Emax)
+    if np.sum(mask) < 8:
+        return None
+
+    E = energy[mask]
+    I = intensity[mask]
+
+    I_min = np.min(I)
+    I_max = np.max(I)
+    if I_max == I_min:
+        return None
+
+    I_norm = (I - I_min) / (I_max - I_min)
+
+    dIdE = np.gradient(I_norm, E)
+    idx_edge = int(np.argmin(dIdE))
+    Ev0 = float(np.clip(E[idx_edge], 0.0, 6.0))
+
+    p0 = [0.0, 1.0, Ev0, 0.3]
+    bounds = (
+        [-0.3, 0.3, 0.0, 0.05],
+        [0.3, 2.0, 6.0, 2.0],
+    )
+
+    try:
+        popt, _ = curve_fit(
+            erfc_edge,
+            E,
+            I_norm,
+            p0=p0,
+            bounds=bounds,
+            maxfev=8000,
+        )
+        B_fit, H_fit, Ev_fit, w_fit = map(float, popt)
+    except Exception:
+        return None
+
+    E_vbm = Ev_fit - (math.sqrt(math.pi) / 2.0) * w_fit
+    return B_fit, H_fit, Ev_fit, w_fit, float(E_vbm)
+
+
+# =============================================================================
+# CALIBRATION + ARRAYS
+# =============================================================================
+
+def calibrate_vamas_file(path: Path) -> CalibrationResult:
+    v = Vamas(str(path))
+    ref_block = choose_reference_block(v.blocks)
+    E_ref = energy_axis(ref_block)
+    I_ref = counts(ref_block)
+    measured = find_peak_position_centroid(E_ref, I_ref)
+    shift = REFERENCE_ENERGY - measured
+
+    return CalibrationResult(
+        c1s_block=(ref_block.block_identifier or "").strip(),
+        c1s_measured_raw_eV=float(measured),
+        shift_eV=float(shift),
+    )
+
+
+def calibrated_arrays_for_file(path: Path, shift_eV: float) -> Dict[str, Dict[str, np.ndarray]]:
+    v = Vamas(str(path))
+    out: Dict[str, Dict[str, np.ndarray]] = {}
+
+    for b in v.blocks:
+        block_id = (b.block_identifier or "").strip() or f"block_{len(out)}"
+        E_raw = energy_axis(b)
+        I_raw = counts(b)
+
+        bg_type = classify_block_for_background(b)
+        if bg_type == "shirley":
+            bg = shirley_background(I_raw)
+        elif bg_type == "edge_down":
+            bg = edge_down_background(E_raw, I_raw)
+        else:
+            bg = np.zeros_like(I_raw)
+
+        I_bgsub = I_raw - bg
+        E_cal = E_raw + shift_eV
+
+        out[block_id] = {
+            "E_raw": E_raw,
+            "E_cal": E_cal,
+            "I_raw": I_raw,
+            "background": bg,
+            "I_bgsub": I_bgsub,
+        }
+
+    return out
+
+
+# =============================================================================
+# PEAK EXTRACTION
+# =============================================================================
+
+def find_main_peak_in_window(E_cal: np.ndarray, I_bgsub: np.ndarray, window: Tuple[float, float]) -> Optional[Tuple[float, float]]:
+    lo, hi = window
+    mask = (E_cal >= lo) & (E_cal <= hi)
+    if np.sum(mask) < 8:
+        return None
+
+    E = E_cal[mask]
+    I = I_bgsub[mask]
+
+    idx = int(np.argmax(I))
+    peak_max_e = float(E[idx])
+    peak_centroid_e = float(find_peak_position_centroid(E, I, window_points=5))
+    return peak_max_e, peak_centroid_e
+
+
+def extract_best_peak(arrays: Dict[str, Dict[str, np.ndarray]], label: str) -> Tuple[Optional[str], Optional[float], Optional[float]]:
+    window = PEAK_WINDOWS[label]
+    best_block = None
+    best_peak = None
+    best_centroid = None
+    best_score = None
+
+    for block_id, arr in arrays.items():
+        E_cal = arr["E_cal"]
+        I_bgsub = arr["I_bgsub"]
+
+        if np.nanmin(E_cal) > window[0] or np.nanmax(E_cal) < window[1]:
+            continue
+
+        result = find_main_peak_in_window(E_cal, I_bgsub, window)
+        if result is None:
+            continue
+
+        peak_max_e, peak_centroid_e = result
+        score = abs(peak_centroid_e - EXPECTED_MAIN_PEAK[label])
+
+        if best_score is None or score < best_score:
+            best_score = score
+            best_block = block_id
+            best_peak = peak_max_e
+            best_centroid = peak_centroid_e
+
+    if best_centroid is None:
+        return None, None, None
+
+    if abs(best_centroid - EXPECTED_MAIN_PEAK[label]) > MAX_PEAK_DEVIATION[label]:
+        return None, None, None
+
+    return best_block, best_peak, best_centroid
+
+
+# =============================================================================
+# FILENAME / PATH PARSING
+# =============================================================================
+
+def build_context_text(path: Path) -> str:
+    return f"{path.stem} {path.parent.as_posix()}".upper()
+
+
+def parse_time_from_text(text: str) -> Optional[int]:
+    patterns = [
+        r'(?<![\d.])(\d+)\s*MIN\b',
+        r'(?<![\d.])(\d+)\s*M(?!M)(?=[A-Z_]|$)',
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            return int(m.group(1))
+
+    return None
+
+
+def parse_material_family_from_text(text: str) -> str:
+    if re.search(r'(^|[_/\s])IR([_/\s]|$)', text):
+        return "IrTiO2"
+    if re.search(r'(^|[_/\s])CO([_/\s]|$)', text):
+        return "CoTiO2"
+    if (
+        re.search(r'(^|[_/\s])FE([_/\s]|$)', text)
+        or "FCH" in text
+        or "FNH" in text
+        or re.search(r'(^|[_/\s-])FC([_/\s-]|$)', text)
+        or "FE1MM" in text
+    ):
+        return "FeTiO2"
+    if "CU" in text or "CUSA" in text:
+        return "CuTiO2"
+    return "plain_TiO2"
+
+
+def parse_scan_type_from_text(text: str) -> Optional[str]:
+    if "PLSV" in text:
+        return "pLSV"
+
+    if "LSV" in text:
+        return "LSV"
+
+    if re.search(r'(^|[_/\s])SL(?=\d|_)', text):
+        return "LSV"
+
+    return None
+
+
+def parse_cycles_from_text(
+    text: str,
+    material_family: Optional[str] = None,
+    scan_type: Optional[str] = None,
+) -> Optional[int]:
+    m = re.search(r'(\d+)\s*CY', text, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+
+    if material_family == "CuTiO2" and scan_type == "LSV":
+        if "CUSA" in text and re.search(r'(^|[_/\s])SL', text):
+            return 3
+
+    return None
+
+
+def infer_scan_type_from_context(
+    text: str,
+    material_family: Optional[str],
+    cycles: Optional[int],
+    current_scan_type: Optional[str],
+) -> Optional[str]:
+    if current_scan_type is not None:
+        return current_scan_type
+
+    if material_family == "FeTiO2":
+        if cycles in {3, 6}:
+            return "LSV"
+        if cycles in {5, 10, 50}:
+            return "pLSV"
+        if "MPL" in text:
+            return "pLSV"
+
+    return current_scan_type
+
+
+def parse_method_from_text(
+    text: str,
+    material_family: Optional[str] = None,
+    scan_type: Optional[str] = None,
+) -> Optional[str]:
+    if re.search(r'(^|[_/\s])WMS([_/\s]|$)', text):
+        return "WMS"
+
+    if "WLS" in text:
+        return "WLS"
+
+    if re.search(r'(^|[_/\s])NLS([_/\s]|$)', text):
+        return "NLS"
+
+    if material_family == "CuTiO2" and scan_type in {"LSV", "pLSV"}:
+        return "NLS"
+
+    return None
+
+
+def parse_preclean_from_text(text: str) -> Optional[str]:
+    if (
+        "WPRE" in text
+        or "WLSPRECLEAN" in text
+        or re.search(r'(^|[_/\s])WP([_/\s]|$)', text)
+    ):
+        return "WP"
+
+    if (
+        "NOPRE" in text
+        or "NO_PRE" in text
+        or "NOPRECLEAN" in text
+        or re.search(r'(^|[_/\s])NC([_/\s]|$)', text)
+    ):
+        return "NC"
+
+    if (
+        "PRE" in text
+        or "NLSPRECLEAN" in text
+        or re.search(r'(^|[_/\s])NP([_/\s]|$)', text)
+    ):
+        return "NP"
+
+    return None
+
+
+def parse_cobalt_family_from_text(text: str) -> Optional[str]:
+    if "COCL" in text or "COCL2" in text:
+        return "CoCl2"
+
+    if re.search(r'CO[N_]', text) and "COCL" not in text:
+        return "CoNit"
+
+    return None
+
+
+def parse_fe_electrolyte_from_text(text: str) -> Optional[str]:
+    if "FCH" in text:
+        return "FCH"
+    if "FNH" in text:
+        return "FNH"
+    if re.search(r'(^|[_/\s-])FC([_/\s-]|$)', text):
+        return "FC"
+
+    if "01MNAS" in text or "01MK" in text:
+        return "FNH"
+
+    return None
+
+
+def parse_ir_thickness_from_text(text: str) -> Optional[str]:
+    if any(tok in text for tok in ["0.05MM", "0_05MM", "0.05 MM", "005MM"]):
+        return "0.05"
+
+    if any(tok in text for tok in ["0.1MM", "0_1MM", "0.1 MM", "01MM"]):
+        return "0.1"
+
+    return None
+
+
+def parse_plain_subtype_from_text(text: str) -> str:
+    if re.search(r'(^|[_/\s-])ARH2([_/\s-]|$)', text) or "AR/H2" in text or "AR_H2" in text:
+        return "Ar/H2"
+
+    if re.search(r'(^|[_/\s-])AIR([_/\s-]|$)', text):
+        return "Air"
+
+    return "plain"
+
+
+def parse_common_tags_from_path(path: Path) -> dict:
+    text = build_context_text(path)
+
+    material_family = parse_material_family_from_text(text)
+    scan_type0 = parse_scan_type_from_text(text)
+    cycles = parse_cycles_from_text(
+        text=text,
+        material_family=material_family,
+        scan_type=scan_type0,
+    )
+    scan_type = infer_scan_type_from_context(
+        text=text,
+        material_family=material_family,
+        cycles=cycles,
+        current_scan_type=scan_type0,
+    )
+
+    return {
+        "time_min": parse_time_from_text(text),
+        "cycles": cycles,
+        "method": parse_method_from_text(
+            text=text,
+            material_family=material_family,
+            scan_type=scan_type,
+        ),
+        "scan_type": scan_type,
+        "preclean": parse_preclean_from_text(text),
+        "material_family": material_family,
+        "co_family": parse_cobalt_family_from_text(text),
+        "fe_electrolyte": parse_fe_electrolyte_from_text(text),
+        "ir_thickness": parse_ir_thickness_from_text(text),
+        "plain_subtype": parse_plain_subtype_from_text(text),
+    }
+
+
+# =============================================================================
+# TAIL-END CLASSIFICATION
+# =============================================================================
+
+def classify_tail_end(
+    erfc_main: Optional[Tuple[float, float, float, float, float]],
+    erfc_check: Optional[Tuple[float, float, float, float, float]],
+    shift_eV: float,
+) -> Tuple[bool, str, Optional[float], Optional[float]]:
+    if erfc_main is None:
+        return True, "erfc_fit_failed_main", None, None
+
+    vbm_main = erfc_main[-1]
+
+    if erfc_check is None:
+        return True, "erfc_fit_failed_check", vbm_main, None
+
+    vbm_check = erfc_check[-1]
+    dv = abs(vbm_main - vbm_check)
+
+    if dv > VBM_STABILITY_THRESH:
+        return True, f"unstable_window_dv>{VBM_STABILITY_THRESH:.2f}", vbm_main, vbm_check
+
+    if vbm_main > MAX_REASONABLE_VBM:
+        return True, "unphysical_high_vbm", vbm_main, vbm_check
+
+    if abs(shift_eV) > MAX_REASONABLE_SHIFT:
+        return True, "large_c1s_shift", vbm_main, vbm_check
+
+    return False, "clean_edge", vbm_main, vbm_check
+
+
+# =============================================================================
+# DERIVED COLUMNS
+# =============================================================================
+
+def attach_unified_peak_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    df["metal_peak_centroid_eV"] = np.nan
+    df["metal_name"] = None
+
+    cu_mask = df["material_family"] == "CuTiO2"
+    fe_mask = df["material_family"] == "FeTiO2"
+    co_mask = df["material_family"] == "CoTiO2"
+    ir_mask = df["material_family"] == "IrTiO2"
+
+    df.loc[cu_mask, "metal_peak_centroid_eV"] = df.loc[cu_mask, "Cu2p_peak_centroid_eV"]
+    df.loc[fe_mask, "metal_peak_centroid_eV"] = df.loc[fe_mask, "Fe2p_peak_centroid_eV"]
+    df.loc[co_mask, "metal_peak_centroid_eV"] = df.loc[co_mask, "Co2p_peak_centroid_eV"]
+    df.loc[ir_mask, "metal_peak_centroid_eV"] = df.loc[ir_mask, "Ir_peak_centroid_eV"]
+
+    df.loc[cu_mask, "metal_name"] = "Cu 2p"
+    df.loc[fe_mask, "metal_name"] = "Fe 2p"
+    df.loc[co_mask, "metal_name"] = "Co 2p"
+    df.loc[ir_mask, "metal_name"] = "Ir"
+
+    return df
+
+
+def attach_absolute_shift_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["O1s_minus_ref_eV"] = df["O1s_peak_centroid_eV"] - REFERENCE_PEAKS["O1s"]
+    df["Ti2p_minus_ref_eV"] = df["Ti2p_peak_centroid_eV"] - REFERENCE_PEAKS["Ti2p"]
+    df["Cu2p_minus_ref_eV"] = df["Cu2p_peak_centroid_eV"] - REFERENCE_PEAKS["Cu2p"]
+    df["Fe2p_minus_ref_eV"] = df["Fe2p_peak_centroid_eV"] - REFERENCE_PEAKS["Fe2p"]
+    df["Co2p_minus_ref_eV"] = df["Co2p_peak_centroid_eV"] - REFERENCE_PEAKS["Co2p"]
+    df["Ir_minus_ref_eV"] = df["Ir_peak_centroid_eV"] - REFERENCE_PEAKS["Ir"]
+    return df
+
+
+# =============================================================================
+# X-LABEL BUILDERS
+# =============================================================================
+
+def label_plain_time(row: pd.Series) -> Optional[str]:
+    if pd.isna(row["time_min"]):
+        return None
+    return f"{int(row['time_min'])}"
+
+
+def label_cu_lsv(row: pd.Series) -> Optional[str]:
+    if pd.isna(row["method"]) or pd.isna(row["cycles"]):
+        return None
+
+    method = str(row["method"])
+    cyc = int(row["cycles"])
+
+    if cyc not in {3, 6}:
+        return None
+    if method not in {"NLS", "WLS"}:
+        return None
+
+    return f"{method} {cyc}cy"
+
+
+def label_cu_plsv(row: pd.Series) -> Optional[str]:
+    if pd.isna(row["method"]) or pd.isna(row["cycles"]):
+        return None
+
+    method = str(row["method"])
+    cyc = int(row["cycles"])
+
+    if cyc != 50:
+        return None
+    if method not in {"NLS", "WLS"}:
+        return None
+
+    return f"{method} {cyc}cy"
+
+
+def label_co_fixed(row: pd.Series) -> Optional[str]:
+    pre = row.get("preclean")
+    method = row.get("method")
+
+    if pd.isna(pre) or pd.isna(method):
+        return None
+
+    pre = str(pre)
+    method = str(method)
+
+    if pre not in {"NC", "NP", "WP"}:
+        return None
+    if method not in {"NLS", "WLS"}:
+        return None
+
+    return f"{pre}-{method}"
+
+
+def label_fe_condition(row: pd.Series) -> Optional[str]:
+    if pd.isna(row["time_min"]) or pd.isna(row["cycles"]) or pd.isna(row["method"]):
+        return None
+
+    t = int(row["time_min"])
+    cyc = int(row["cycles"])
+    method = str(row["method"])
+
+    if method not in {"NLS", "WLS", "WMS"}:
+        return None
+
+    return f"{t} min | {cyc}cy | {method}"
+
+
+def label_ir_fixed(row: pd.Series) -> Optional[str]:
+    pre = row.get("preclean")
+    thick = row.get("ir_thickness")
+    method = row.get("method")
+
+    if pd.isna(pre) or pd.isna(thick) or pd.isna(method):
+        return None
+
+    pre = str(pre)
+    thick = str(thick)
+    method = str(method)
+
+    if pre not in {"NP", "WP"}:
+        return None
+    if thick not in {"0.05", "0.1"}:
+        return None
+    if method not in {"NLS", "WLS"}:
+        return None
+
+    return f"{pre}-{thick}-{method}"
+
+
+# =============================================================================
+# AUDIT
+# =============================================================================
+
+def save_parse_audit(df: pd.DataFrame, outdir: Path):
+    audit = df.copy()
+
+    audit["plain_xcat"] = audit.apply(label_plain_time, axis=1)
+    audit["cu_lsv_xcat"] = audit.apply(label_cu_lsv, axis=1)
+    audit["cu_plsv_xcat"] = audit.apply(label_cu_plsv, axis=1)
+    audit["co_xcat"] = audit.apply(label_co_fixed, axis=1)
+    audit["fe_xcat"] = audit.apply(label_fe_condition, axis=1)
+    audit["ir_xcat"] = audit.apply(label_ir_fixed, axis=1)
+
+    cols = [
+        "sample",
+        "material_family",
+        "plain_subtype",
+        "scan_type",
+        "time_min",
+        "cycles",
+        "method",
+        "preclean",
+        "co_family",
+        "fe_electrolyte",
+        "ir_thickness",
+        "tail_end",
+        "tail_reason",
+        "plain_xcat",
+        "cu_lsv_xcat",
+        "cu_plsv_xcat",
+        "co_xcat",
+        "fe_xcat",
+        "ir_xcat",
+    ]
+    cols = [c for c in cols if c in audit.columns]
+    audit[cols].to_csv(outdir / "parse_audit.csv", index=False)
+
+
+# =============================================================================
+# PLOT HELPERS
+# =============================================================================
+
+def choose_tick_step(ymin: float, ymax: float) -> float:
+    yrange = float(ymax - ymin)
+    if yrange <= 2.0:
+        return 0.2
+    if yrange <= 4.0:
+        return 0.5
+    if yrange <= 8.0:
+        return 1.0
+    return 2.0
+
+
+def set_axis_from_data(ax, values: np.ndarray, pad: float = 0.15):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return
+
+    ymin = float(np.min(values))
+    ymax = float(np.max(values))
+
+    if abs(ymax - ymin) < 1e-9:
+        ymin -= 0.2
+        ymax += 0.2
+    else:
+        ymin -= pad
+        ymax += pad
+
+    step = choose_tick_step(ymin, ymax)
+    lo = math.floor(ymin / step) * step
+    hi = math.ceil(ymax / step) * step
+    if hi <= lo:
+        hi = lo + step
+
+    ax.set_ylim(lo, hi)
+    ax.set_yticks(np.arange(lo, hi + 1e-9, step))
+
+
+def bare_tio2_label(time_min: int) -> str:
+    return f"bare TiO2 {int(time_min)}m"
+
+
+def sorted_unique_times(df_panel: pd.DataFrame) -> List[int]:
+    vals = []
+    for x in df_panel["time_min"].dropna().unique():
+        try:
+            vals.append(int(x))
+        except Exception:
+            pass
+    return sorted(set(vals))
+
+
+def collect_bare_reference_rows(
+    full_df: pd.DataFrame,
+    times: List[int],
+    x_col: str = "xcat",
+) -> pd.DataFrame:
+    """
+    Bare reference should come from untreated plain TiO2 only, not from
+    Ar/H2 or Air-treated plain variants.
+    """
+    frames = []
+
+    for t in times:
+        bare = full_df[
+            (full_df["material_family"] == "plain_TiO2") &
+            (full_df["time_min"] == t) &
+            (full_df["plain_subtype"] == "plain") &
+            (
+                full_df["chosen_vbm_eV"].notna() |
+                full_df["vbm_check_eV"].notna()
+            )
+        ].copy()
+
+        if len(bare) == 0:
+            bare = full_df[
+                (full_df["material_family"] == "plain_TiO2") &
+                (full_df["time_min"] == t) &
+                (
+                    full_df["chosen_vbm_eV"].notna() |
+                    full_df["vbm_check_eV"].notna()
+                )
+            ].copy()
+
+        if len(bare) == 0:
+            continue
+
+        bare = bare.iloc[[0]].copy()
+        bare["chosen_vbm_eV"] = bare["chosen_vbm_eV"].where(bare["chosen_vbm_eV"].notna(), bare["vbm_check_eV"])
+        bare[x_col] = bare_tio2_label(t)
+        bare["metal_peak_centroid_eV"] = np.nan
+        bare["metal_name"] = None
+        frames.append(bare)
+
+    if not frames:
+        return pd.DataFrame(columns=full_df.columns)
+
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def aggregate_panel(df_panel: pd.DataFrame, x_col: str, x_order: List[str]) -> pd.DataFrame:
+    cols = [
+        x_col,
+        "time_min",
+        "chosen_vbm_eV",
+        "O1s_peak_centroid_eV",
+        "Ti2p_peak_centroid_eV",
+        "metal_peak_centroid_eV",
+    ]
+    sub = df_panel[cols].copy()
+    sub = sub[sub[x_col].notna()].copy()
+    if len(sub) == 0:
+        return sub
+
+    g = (
+        sub.groupby(x_col, as_index=False)
+        .agg({
+            "time_min": "first",
+            "chosen_vbm_eV": "mean",
+            "O1s_peak_centroid_eV": "mean",
+            "Ti2p_peak_centroid_eV": "mean",
+            "metal_peak_centroid_eV": "mean",
+        })
+    )
+
+    x_map = {lab: i for i, lab in enumerate(x_order)}
+    g = g[g[x_col].isin(x_map)].copy()
+    g["xpos"] = g[x_col].map(x_map)
+    g = g.sort_values("xpos").reset_index(drop=True)
+    return g
+
+
+def compute_grouped_mixed_anchor_series(
+    g: pd.DataFrame,
+    x_col: str,
+    bare_labels: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    g = g.copy()
+    if len(g) == 0:
+        return g
+
+    bare_set = set(bare_labels or [])
+
+    g["anchor_group"] = g["time_min"].copy()
+    g.loc[g["anchor_group"].isna(), "anchor_group"] = -1
+
+    g["support_anchor_label"] = None
+    g["support_anchor_vbm_eV"] = np.nan
+    g["metal_anchor_label"] = None
+    g["metal_anchor_vbm_eV"] = np.nan
+
+    g["VBM_plot_eV"] = g["chosen_vbm_eV"]
+    g["O1s_plot_eV"] = np.nan
+    g["Ti2p_plot_eV"] = np.nan
+    g["metal_plot_eV"] = np.nan
+
+    for grp in g["anchor_group"].drop_duplicates():
+        mask = g["anchor_group"] == grp
+        gg = g.loc[mask].sort_values("xpos").copy()
+
+        support_mask = gg[x_col].isin(bare_set)
+        if support_mask.any():
+            support_anchor = gg[support_mask].iloc[0]
+        else:
+            support_anchor = gg.iloc[0]
+
+        support_vbm0 = support_anchor["chosen_vbm_eV"]
+        o1s0 = support_anchor["O1s_peak_centroid_eV"]
+        ti2p0 = support_anchor["Ti2p_peak_centroid_eV"]
+
+        g.loc[mask, "support_anchor_label"] = support_anchor[x_col]
+        g.loc[mask, "support_anchor_vbm_eV"] = support_vbm0
+
+        if pd.notna(support_vbm0) and pd.notna(o1s0):
+            g.loc[mask, "O1s_plot_eV"] = support_vbm0 + (g.loc[mask, "O1s_peak_centroid_eV"] - o1s0)
+
+        if pd.notna(support_vbm0) and pd.notna(ti2p0):
+            g.loc[mask, "Ti2p_plot_eV"] = support_vbm0 + (g.loc[mask, "Ti2p_peak_centroid_eV"] - ti2p0)
+
+        metal_mask = (
+            gg["metal_peak_centroid_eV"].notna()
+            & gg["chosen_vbm_eV"].notna()
+            & (~gg[x_col].isin(bare_set))
+        )
+
+        if metal_mask.any():
+            metal_anchor = gg[metal_mask].iloc[0]
+            metal_vbm0 = metal_anchor["chosen_vbm_eV"]
+            metal0 = metal_anchor["metal_peak_centroid_eV"]
+
+            g.loc[mask, "metal_anchor_label"] = metal_anchor[x_col]
+            g.loc[mask, "metal_anchor_vbm_eV"] = metal_vbm0
+
+            metal_rows = mask & g["metal_peak_centroid_eV"].notna()
+            g.loc[metal_rows, "metal_plot_eV"] = (
+                metal_vbm0 + (g.loc[metal_rows, "metal_peak_centroid_eV"] - metal0)
+            )
+
+    return g
+
+
+def plot_fixed_axis_panel(
+    df_panel: pd.DataFrame,
+    x_col: str,
+    x_order: List[str],
+    title: str,
+    out_path: Path,
+    metal_label: Optional[str],
+    rotate_xticks: int = 0,
+    bare_labels: Optional[List[str]] = None,
+):
+    if len(df_panel) == 0:
+        return
+
+    g = aggregate_panel(df_panel, x_col=x_col, x_order=x_order)
+    if len(g) == 0:
+        return
+
+    g = compute_grouped_mixed_anchor_series(g, x_col=x_col, bare_labels=bare_labels)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    series = [
+        ("O1s_plot_eV", "O 1s", "^"),
+        ("Ti2p_plot_eV", "Ti 2p", "o"),
+        ("VBM_plot_eV", "VBM", "d"),
+    ]
+    if metal_label is not None:
+        series.insert(2, ("metal_plot_eV", metal_label, "v"))
+
+    all_y = []
+
+    for col, lab, marker in series:
+        tmp = g[["xpos", x_col, col]].copy()
+        tmp = tmp[tmp[col].notna()]
+        if len(tmp) == 0:
+            continue
+
+        ax.plot(
+            tmp["xpos"],
+            tmp[col],
+            marker=marker,
+            linestyle="-",
+            linewidth=2.0,
+            markersize=7,
+            label=lab,
+        )
+        all_y.extend(tmp[col].tolist())
+
+    if len(all_y) == 0:
+        plt.close()
+        return
+
+    ax.set_xticks(range(len(x_order)))
+    ax.set_xticklabels(x_order, rotation=rotate_xticks)
+    ax.set_ylabel(r"$E_F - E_{VB}$ (eV)")
+    ax.set_title(title)
+    ax.legend(frameon=True)
+
+    set_axis_from_data(ax, np.array(all_y), pad=0.18)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+
+
+def build_fe_xorder_lsv(df_panel: pd.DataFrame) -> Tuple[List[str], List[str]]:
+    sub = df_panel[df_panel["xcat"].notna()][["xcat", "time_min", "cycles", "method"]].drop_duplicates().copy()
+    if len(sub) == 0:
+        return [], []
+
+    times = sorted_unique_times(sub)
+    x_order: List[str] = []
+    bare_labels: List[str] = []
+
+    for t in times:
+        bare_lab = bare_tio2_label(t)
+        x_order.append(bare_lab)
+        bare_labels.append(bare_lab)
+
+        ss = sub[sub["time_min"] == t].copy()
+        ss["cycle_sort"] = ss["cycles"].apply(lambda x: int(x) if pd.notna(x) else 999)
+        ss["method_sort"] = ss["method"].map(lambda x: FE_METHOD_ORDER.get(str(x), 999))
+        ss["cycle_bucket"] = ss["cycle_sort"].apply(
+            lambda c: 0 if c == 3 else (1 if c == 6 else (2 if c == 5 else (3 if c == 10 else (4 if c == 50 else 5))))
+        )
+        ss = ss.sort_values(["cycle_bucket", "cycle_sort", "method_sort", "xcat"])
+        x_order.extend(ss["xcat"].tolist())
+
+    seen = set()
+    out = []
+    for lab in x_order:
+        if lab not in seen:
+            seen.add(lab)
+            out.append(lab)
+
+    return out, bare_labels
+
+
+def build_fe_xorder_plsv(times: List[int]) -> Tuple[List[str], List[str]]:
+    x_order: List[str] = []
+    bare_labels: List[str] = []
+
+    for t in times:
+        bare_lab = bare_tio2_label(t)
+        bare_labels.append(bare_lab)
+        x_order.extend([
+            bare_lab,
+            f"{t} min | 5cy | NLS",
+            f"{t} min | 5cy | WLS",
+            f"{t} min | 10cy | NLS",
+            f"{t} min | 10cy | WLS",
+            f"{t} min | 50cy | WLS",
+        ])
+
+    return x_order, bare_labels
+
+
+# =============================================================================
+# FIXED PANELS
+# =============================================================================
+
+def plot_plain_tio2(df: pd.DataFrame, outdir: Path):
+    sub = df[(df["material_family"] == "plain_TiO2")].copy()
+    if len(sub) == 0:
+        return
+
+    sub["plain_vbm_plot_eV"] = sub["chosen_vbm_eV"].where(
+        sub["chosen_vbm_eV"].notna(),
+        sub["vbm_check_eV"],
+    )
+    sub = sub[sub["plain_vbm_plot_eV"].notna()].copy()
+    if len(sub) == 0:
+        return
+
+    style_map = {
+        "plain": {"label": "plain", "marker": "^", "linestyle": ":", "linewidth": 2.2, "markersize": 10},
+        "Air": {"label": "plain | Air", "marker": "o", "linestyle": "None", "linewidth": 0.0, "markersize": 11},
+        "Ar/H2": {"label": "plain | Ar/H2", "marker": "s", "linestyle": "None", "linewidth": 0.0, "markersize": 11},
+    }
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    all_y = []
+
+    for subtype in ["plain", "Air", "Ar/H2"]:
+        ss = sub[sub["plain_subtype"] == subtype].copy()
+        if len(ss) == 0:
+            continue
+
+        g = (
+            ss.groupby("time_min", as_index=False)
+            .agg({"plain_vbm_plot_eV": "mean"})
+            .sort_values("time_min")
+        )
+        if len(g) == 0:
+            continue
+
+        st = style_map[subtype]
+        ax.plot(
+            g["time_min"],
+            g["plain_vbm_plot_eV"],
+            marker=st["marker"],
+            linestyle=st["linestyle"],
+            linewidth=st["linewidth"],
+            markersize=st["markersize"],
+            label=st["label"],
+        )
+        all_y.extend(g["plain_vbm_plot_eV"].tolist())
+
+    if len(all_y) == 0:
+        plt.close()
+        return
+
+    ax.set_xticks([30, 60, 120])
+    ax.set_xlim(25, 125)
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel(r"$E_F - E_{VB}$ (eV)")
+    ax.set_title("TiO2: clean-edge samples")
+    ax.legend(frameon=True)
+
+    set_axis_from_data(ax, np.array(all_y), pad=0.18)
+
+    plt.tight_layout()
+    plt.savefig(outdir / "plain_TiO2_clean_edge_samples.png", dpi=300)
+    plt.close()
+
+
+def plot_cu_lsv(df: pd.DataFrame, outdir: Path):
+    sub = df[
+        (df["material_family"] == "CuTiO2") &
+        (df["scan_type"] == "LSV") &
+        (df["tail_end"] == False)
+    ].copy()
+    if len(sub) == 0:
+        return
+
+    sub["xcat"] = sub.apply(label_cu_lsv, axis=1)
+
+    for t in [30, 60, 120]:
+        ss = sub[sub["time_min"] == t].copy()
+        if len(ss) == 0:
+            continue
+
+        bare_rows = collect_bare_reference_rows(df, [t], x_col="xcat")
+        if len(bare_rows) > 0:
+            ss = pd.concat([bare_rows, ss], ignore_index=True, sort=False)
+
+        bare_labels = [bare_tio2_label(t)]
+        x_order = bare_labels + XORDER_CU_LSV
+
+        plot_fixed_axis_panel(
+            df_panel=ss,
+            x_col="xcat",
+            x_order=x_order,
+            title=f"Cu/TiO2 LSV ({t} min)",
+            out_path=outdir / f"CuTiO2_LSV_{t}min.png",
+            metal_label="Cu 2p",
+            rotate_xticks=0,
+            bare_labels=bare_labels,
+        )
+
+
+def plot_cu_plsv(df: pd.DataFrame, outdir: Path):
+    sub = df[
+        (df["material_family"] == "CuTiO2") &
+        (df["scan_type"] == "pLSV") &
+        (df["tail_end"] == False)
+    ].copy()
+    if len(sub) == 0:
+        return
+
+    sub["xcat"] = sub.apply(label_cu_plsv, axis=1)
+
+    times_present = sorted_unique_times(sub)
+    if not times_present:
+        times_present = [None]
+
+    for t in times_present:
+        if t is None:
+            ss = sub.copy()
+            bare_labels = []
+            x_order = XORDER_CU_PLSV
+            title = "Cu/TiO2 pLSV"
+            suffix = "all"
+        else:
+            ss = sub[sub["time_min"] == t].copy()
+            if len(ss) == 0:
+                continue
+
+            bare_rows = collect_bare_reference_rows(df, [t], x_col="xcat")
+            if len(bare_rows) > 0:
+                ss = pd.concat([bare_rows, ss], ignore_index=True, sort=False)
+
+            bare_labels = [bare_tio2_label(t)]
+            x_order = bare_labels + XORDER_CU_PLSV
+            title = f"Cu/TiO2 pLSV ({t} min)"
+            suffix = f"{t}min"
+
+        plot_fixed_axis_panel(
+            df_panel=ss,
+            x_col="xcat",
+            x_order=x_order,
+            title=title,
+            out_path=outdir / f"CuTiO2_pLSV_{suffix}.png",
+            metal_label="Cu 2p",
+            rotate_xticks=0,
+            bare_labels=bare_labels,
+        )
+
+
+def plot_co_tio2(df: pd.DataFrame, outdir: Path):
+    sub = df[(df["material_family"] == "CoTiO2") & (df["tail_end"] == False)].copy()
+    if len(sub) == 0:
+        return
+
+    sub["xcat"] = sub.apply(label_co_fixed, axis=1)
+
+    for family in ["CoCl2", "CoNit"]:
+        fam = sub[sub["co_family"] == family].copy()
+        if len(fam) == 0:
+            continue
+
+        times_present = sorted_unique_times(fam)
+
+        if times_present:
+            for t in times_present:
+                ss = fam[fam["time_min"] == t].copy()
+                if len(ss) == 0:
+                    continue
+
+                bare_rows = collect_bare_reference_rows(df, [t], x_col="xcat")
+                if len(bare_rows) > 0:
+                    ss = pd.concat([bare_rows, ss], ignore_index=True, sort=False)
+
+                bare_labels = [bare_tio2_label(t)]
+                x_order = bare_labels + XORDER_CO
+
+                plot_fixed_axis_panel(
+                    df_panel=ss,
+                    x_col="xcat",
+                    x_order=x_order,
+                    title=f"{family} Co/TiO2 ({t} min)",
+                    out_path=outdir / f"CoTiO2_{family}_{t}min.png",
+                    metal_label="Co 2p",
+                    rotate_xticks=0,
+                    bare_labels=bare_labels,
+                )
+        else:
+            plot_fixed_axis_panel(
+                df_panel=fam,
+                x_col="xcat",
+                x_order=XORDER_CO,
+                title=f"{family} Co/TiO2",
+                out_path=outdir / f"CoTiO2_{family}.png",
+                metal_label="Co 2p",
+                rotate_xticks=0,
+                bare_labels=None,
+            )
+
+
+def plot_fe_tio2(df: pd.DataFrame, outdir: Path):
+    sub = df[
+        (df["material_family"] == "FeTiO2") &
+        (df["tail_end"] == False)
+    ].copy()
+    if len(sub) == 0:
+        return
+
+    sub["xcat"] = sub.apply(label_fe_condition, axis=1)
+
+    for scan_type in ["LSV", "pLSV"]:
+        scan_sub = sub[sub["scan_type"] == scan_type].copy()
+        if len(scan_sub) == 0:
+            continue
+
+        for family in ["FC", "FCH", "FNH"]:
+            fam = scan_sub[scan_sub["fe_electrolyte"] == family].copy()
+            if len(fam) == 0:
+                continue
+
+            times = sorted_unique_times(fam)
+            bare_rows = collect_bare_reference_rows(df, times, x_col="xcat")
+            if len(bare_rows) > 0:
+                fam = pd.concat([bare_rows, fam], ignore_index=True, sort=False)
+
+            if scan_type == "pLSV":
+                x_order, bare_labels = build_fe_xorder_plsv(times)
+            else:
+                x_order, bare_labels = build_fe_xorder_lsv(fam)
+
+            if len(x_order) == 0:
+                continue
+
+            fam_title = FE_FAMILY_TITLE.get(family, family)
+
+            plot_fixed_axis_panel(
+                df_panel=fam,
+                x_col="xcat",
+                x_order=x_order,
+                title=f"Fe/TiO2 {scan_type} ({fam_title})",
+                out_path=outdir / f"FeTiO2_{scan_type}_{family}.png",
+                metal_label="Fe 2p",
+                rotate_xticks=25,
+                bare_labels=bare_labels,
+            )
+
+
+def plot_ir_tio2(df: pd.DataFrame, outdir: Path):
+    sub = df[(df["material_family"] == "IrTiO2") & (df["tail_end"] == False)].copy()
+    if len(sub) == 0:
+        return
+
+    sub["xcat"] = sub.apply(label_ir_fixed, axis=1)
+
+    times_present = sorted_unique_times(sub)
+
+    if times_present:
+        for t in times_present:
+            ss = sub[sub["time_min"] == t].copy()
+            if len(ss) == 0:
+                continue
+
+            bare_rows = collect_bare_reference_rows(df, [t], x_col="xcat")
+            if len(bare_rows) > 0:
+                ss = pd.concat([bare_rows, ss], ignore_index=True, sort=False)
+
+            bare_labels = [bare_tio2_label(t)]
+            x_order = bare_labels + XORDER_IR
+
+            plot_fixed_axis_panel(
+                df_panel=ss,
+                x_col="xcat",
+                x_order=x_order,
+                title=f"Ir/TiO2 ({t} min)",
+                out_path=outdir / f"IrTiO2_{t}min.png",
+                metal_label="Ir",
+                rotate_xticks=35,
+                bare_labels=bare_labels,
+            )
+    else:
+        plot_fixed_axis_panel(
+            df_panel=sub,
+            x_col="xcat",
+            x_order=XORDER_IR,
+            title="Ir/TiO2",
+            out_path=outdir / "IrTiO2.png",
+            metal_label="Ir",
+            rotate_xticks=35,
+            bare_labels=None,
+        )
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    vms_files: List[Path] = []
+    for root in DATA_ROOTS:
+        if root.exists():
+            vms_files.extend(list(root.rglob("*.vms")))
+    vms_files = sorted(set(vms_files))
+
+    print("Scanning roots:")
+    for r in DATA_ROOTS:
+        print("  -", r)
+    print(f"Found {len(vms_files)} .vms files\n")
+
+    rows = []
+
+    for vms_path in vms_files:
+        stem = vms_path.stem
+        folder = vms_path.parent.name
+        meta = parse_common_tags_from_path(vms_path)
+
+        try:
+            cal = calibrate_vamas_file(vms_path)
+            arrays = calibrated_arrays_for_file(vms_path, cal.shift_eV)
+
+            vb_block = choose_vb_block_from_arrays(arrays)
+            erfc_main = None
+            erfc_check = None
+
+            if vb_block is not None:
+                arr = arrays[vb_block]
+                E_cal = arr["E_cal"]
+                I_bgsub = arr["I_bgsub"]
+                I_smooth = smooth_intensity(I_bgsub)
+
+                erfc_main = fit_vbm_erfc(E_cal, I_smooth, VB_REGION_MAIN)
+                erfc_check = fit_vbm_erfc(E_cal, I_smooth, VB_REGION_CHECK)
+
+            tail_end, tail_reason, vbm_main, vbm_check = classify_tail_end(
+                erfc_main=erfc_main,
+                erfc_check=erfc_check,
+                shift_eV=cal.shift_eV,
+            )
+
+            peak_data = {}
+            for label in ["O1s", "Ti2p", "Cu2p", "Fe2p", "Co2p", "Ir"]:
+                peak_data[label] = extract_best_peak(arrays, label)
+
+            rows.append({
+                "file": str(vms_path),
+                "sample": stem,
+                "folder": folder,
+
+                "time_min": meta["time_min"],
+                "cycles": meta["cycles"],
+                "method": meta["method"],
+                "scan_type": meta["scan_type"],
+                "preclean": meta["preclean"],
+                "material_family": meta["material_family"],
+                "co_family": meta["co_family"],
+                "fe_electrolyte": meta["fe_electrolyte"],
+                "ir_thickness": meta["ir_thickness"],
+                "plain_subtype": meta["plain_subtype"],
+
+                "c1s_block": cal.c1s_block,
+                "c1s_measured_raw_eV": cal.c1s_measured_raw_eV,
+                "energy_shift_eV": cal.shift_eV,
+
+                "vb_block": vb_block,
+                "vbm_main_eV": vbm_main,
+                "vbm_check_eV": vbm_check,
+                "dvbm_main_vs_check_eV": (
+                    abs(vbm_main - vbm_check)
+                    if (vbm_main is not None and vbm_check is not None)
+                    else None
+                ),
+                "chosen_vbm_eV": vbm_main,
+                "tail_end": tail_end,
+                "tail_reason": tail_reason,
+
+                "O1s_block": peak_data["O1s"][0],
+                "O1s_peak_max_eV": peak_data["O1s"][1],
+                "O1s_peak_centroid_eV": peak_data["O1s"][2],
+
+                "Ti2p_block": peak_data["Ti2p"][0],
+                "Ti2p_peak_max_eV": peak_data["Ti2p"][1],
+                "Ti2p_peak_centroid_eV": peak_data["Ti2p"][2],
+
+                "Cu2p_block": peak_data["Cu2p"][0],
+                "Cu2p_peak_max_eV": peak_data["Cu2p"][1],
+                "Cu2p_peak_centroid_eV": peak_data["Cu2p"][2],
+
+                "Fe2p_block": peak_data["Fe2p"][0],
+                "Fe2p_peak_max_eV": peak_data["Fe2p"][1],
+                "Fe2p_peak_centroid_eV": peak_data["Fe2p"][2],
+
+                "Co2p_block": peak_data["Co2p"][0],
+                "Co2p_peak_max_eV": peak_data["Co2p"][1],
+                "Co2p_peak_centroid_eV": peak_data["Co2p"][2],
+
+                "Ir_block": peak_data["Ir"][0],
+                "Ir_peak_max_eV": peak_data["Ir"][1],
+                "Ir_peak_centroid_eV": peak_data["Ir"][2],
+            })
+
+            print(f"[OK] {vms_path.name:45s} material={meta['material_family']:12s} VBM={vbm_main}")
+
+        except Exception as e:
+            rows.append({
+                "file": str(vms_path),
+                "sample": stem,
+                "folder": folder,
+
+                "time_min": meta["time_min"],
+                "cycles": meta["cycles"],
+                "method": meta["method"],
+                "scan_type": meta["scan_type"],
+                "preclean": meta["preclean"],
+                "material_family": meta["material_family"],
+                "co_family": meta["co_family"],
+                "fe_electrolyte": meta["fe_electrolyte"],
+                "ir_thickness": meta["ir_thickness"],
+                "plain_subtype": meta["plain_subtype"],
+
+                "c1s_block": None,
+                "c1s_measured_raw_eV": None,
+                "energy_shift_eV": None,
+
+                "vb_block": None,
+                "vbm_main_eV": None,
+                "vbm_check_eV": None,
+                "dvbm_main_vs_check_eV": None,
+                "chosen_vbm_eV": None,
+                "tail_end": True,
+                "tail_reason": f"error:{type(e).__name__}",
+
+                "O1s_block": None, "O1s_peak_max_eV": None, "O1s_peak_centroid_eV": None,
+                "Ti2p_block": None, "Ti2p_peak_max_eV": None, "Ti2p_peak_centroid_eV": None,
+                "Cu2p_block": None, "Cu2p_peak_max_eV": None, "Cu2p_peak_centroid_eV": None,
+                "Fe2p_block": None, "Fe2p_peak_max_eV": None, "Fe2p_peak_centroid_eV": None,
+                "Co2p_block": None, "Co2p_peak_max_eV": None, "Co2p_peak_centroid_eV": None,
+                "Ir_block": None, "Ir_peak_max_eV": None, "Ir_peak_centroid_eV": None,
+            })
+            print(f"[ERR] {vms_path.name}: {e}")
+
+    df = pd.DataFrame(rows)
+    df = attach_unified_peak_columns(df)
+    df = attach_absolute_shift_columns(df)
+
+    sort_cols = [c for c in ["material_family", "plain_subtype", "scan_type", "time_min", "cycles", "method", "sample"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(by=sort_cols, kind="mergesort")
+
+    csv_path = OUTPUT_DIR / "summary.csv"
+    xlsx_path = OUTPUT_DIR / "summary.xlsx"
+    df.to_csv(csv_path, index=False)
+    try:
+        df.to_excel(xlsx_path, index=False)
+    except Exception as e:
+        print("[WARN] Excel export failed:", e)
+
+    save_parse_audit(df, OUTPUT_DIR)
+
+    plain_diag = df[df["material_family"] == "plain_TiO2"][
+        [
+            "sample",
+            "time_min",
+            "plain_subtype",
+            "tail_end",
+            "tail_reason",
+            "vbm_main_eV",
+            "vbm_check_eV",
+            "chosen_vbm_eV",
+        ]
+    ].copy()
+    plain_diag.to_csv(OUTPUT_DIR / "plain_TiO2_diagnostic.csv", index=False)
+
+    print("\nSaved summary:")
+    print("  -", csv_path)
+    print("  -", xlsx_path)
+    print("  -", OUTPUT_DIR / "parse_audit.csv")
+    print("  -", OUTPUT_DIR / "plain_TiO2_diagnostic.csv")
+
+    plot_plain_tio2(df, OUTPUT_DIR)
+    plot_cu_lsv(df, OUTPUT_DIR)
+    plot_cu_plsv(df, OUTPUT_DIR)
+    plot_co_tio2(df, OUTPUT_DIR)
+    plot_fe_tio2(df, OUTPUT_DIR)
+    plot_ir_tio2(df, OUTPUT_DIR)
+
+    print("\nDone. Plots saved in:")
+    print("  -", OUTPUT_DIR)
+
+
+if __name__ == "__main__":
+    main()
